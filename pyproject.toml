@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scopia"
+version = "0.1.0"
+description = "See the shape of a code change before reading its lines."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Samarth" }]
+keywords = ["code-review", "diff", "call-graph", "static-analysis", "git"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+
+# Kept deliberately small. Every dependency is a way for `pip install` to fail on
+# someone else's machine, and all three of these ship abi3 wheels, so no compiler
+# is needed at install time.
+dependencies = [
+  "tree-sitter>=0.23,<0.27",
+  "tree-sitter-python>=0.23",
+  "tree-sitter-php>=0.23",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+scopia = "scopia.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/printSamarth/scopia"
+Issues = "https://github.com/printSamarth/scopia/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scopia"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The page template is embedded markup; wrapping its lines hurts rather than helps.
+"scopia/render/html.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
