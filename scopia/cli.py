@@ -32,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Examples:\n"
         "  scopia                       review the working tree against HEAD\n"
         "  scopia HEAD~3..HEAD          review a range\n"
-        "  scopia main.. --html r.html  write a self-contained report\n",
+        "  scopia main.. --html r.html  write a self-contained report\n"
+        "  scopia --watch               keep the graph current while an agent writes\n"
+        "  scopia --watch --html        the same, as a live page in your browser\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -40,7 +42,31 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="revision or range (default: working tree vs HEAD)",
     )
-    parser.add_argument("--html", metavar="PATH", help="write a self-contained HTML report")
+    parser.add_argument(
+        "--html",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        default=None,
+        help="write a self-contained HTML report; with --watch, serve it live instead "
+        "(PATH, if given, is also rewritten on each update)",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="follow the working tree and redraw as files settle; Ctrl-C to quit",
+    )
+    parser.add_argument(
+        "--lsp",
+        action="store_true",
+        help="sharpen name-matched edges with a language server when one is installed "
+        "(Python: jedi-language-server). Falls back silently to static analysis.",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="with --watch --html, print the URL without opening a browser",
+    )
     parser.add_argument(
         "--format",
         choices=("text", "mermaid", "json"),
@@ -58,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_NODES,
         help=f"cap on drawn nodes (default: {DEFAULT_MAX_NODES})",
+    )
+    parser.add_argument(
+        "--to-entry",
+        action="store_true",
+        help="climb callers until each chain reaches an entry point — the route, job "
+        "or command that triggers the changed code",
     )
     parser.add_argument(
         "--utility",
@@ -95,12 +127,33 @@ def main(argv: list[str] | None = None) -> int:
 
     opts = build_parser().parse_args(args)
 
+    if opts.watch:
+        problem = _watch_conflict(opts)
+        if problem:
+            print(f"scopia: {problem}", file=sys.stderr)
+            return 2
+    elif opts.html == "":
+        print(
+            "scopia: --html needs a PATH to write to (or add --watch to serve it live).",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         repo = Repo.discover(Path.cwd())
     except GitError as exc:
         print(f"scopia: {exc}", file=sys.stderr)
         print("scopia needs to run inside a git repository.", file=sys.stderr)
         return 2
+
+    if opts.watch:
+        try:
+            return _watch(repo, opts)
+        except KeyboardInterrupt:
+            # An impatient second Ctrl-C lands while the first is still tearing down.
+            # Quitting is what was asked for either way; a stack trace just makes a
+            # normal exit look like a crash.
+            return 0
 
     try:
         graph = build_graph(
@@ -111,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             jobs=opts.jobs,
             utility_fan_in=opts.utility,
             exclude=tuple(opts.exclude),
+            to_entry=opts.to_entry,
         )
     except GitError as exc:
         print(f"scopia: {exc}", file=sys.stderr)
@@ -122,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     if not graph.nodes:
         print("No changes in supported files.")
         return 0
+
+    if opts.lsp:
+        graph = _refine(repo, graph)
 
     if not opts.always and _below_gate(graph):
         print(_gate_message(graph))
@@ -146,6 +203,96 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _watch_conflict(opts: argparse.Namespace) -> str:
+    if opts.revisions:
+        return "--watch follows the working tree against HEAD; drop the revision."
+    if opts.format != "text":
+        return "--watch draws the text report or the live page; --format does not apply."
+    return ""
+
+
+def _graceful_signals() -> None:
+    """Turn SIGTERM and SIGHUP (a closed terminal) into the same clean exit as Ctrl-C.
+
+    Left alone they kill the process without running `finally` blocks, which strands any
+    language server as an orphan — and not every server exits when its stdin closes.
+    """
+    import signal
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
+
+
+def _watch(repo: Repo, opts: argparse.Namespace) -> int:
+    from .watch.loop import Watcher
+
+    _graceful_signals()
+
+    # The graph starts blank and fills in as work lands. Diffing against HEAD would
+    # open with everything already uncommitted — in a dirty tree that is hundreds of
+    # nodes, and the file just written is lost among them.
+    session_start = repo.working_tree_shas()
+
+    def changed_since_start() -> frozenset[str]:
+        now = repo.working_tree_shas()
+        moved = {path for path, sha in now.items() if session_start.get(path) != sha}
+        moved |= {path for path in session_start if path not in now}  # deleted
+        return frozenset(moved)
+
+    def build() -> Graph:
+        # Watch has no gate: a small change is exactly what you want to see arrive.
+        return build_graph(
+            repo,
+            parse_revisions(None),
+            hops=opts.hops,
+            max_nodes=opts.max_nodes,
+            jobs=1,
+            utility_fan_in=opts.utility,
+            exclude=tuple(opts.exclude),
+            to_entry=opts.to_entry,
+            only_paths=changed_since_start(),
+        )
+
+    watcher = Watcher(repo, build)
+    upgrader = _upgrader(repo, opts)
+    if opts.html is None:
+        from .render import text
+        from .watch import terminal
+
+        color = False if opts.no_color else text.supports_color()
+        return terminal.run(watcher, color=color, upgrader=upgrader)
+
+    from .watch import live
+    from .watch.server import LiveServer
+
+    server = LiveServer()
+    server.start()
+    print(f"scopia watching {repo.root}\nlive page: {server.url}  (Ctrl-C to quit)")
+    if not opts.no_open:
+        import webbrowser
+
+        webbrowser.open(server.url)
+    return live.run(
+        watcher,
+        server,
+        upgrader=upgrader,
+        also_write=Path(opts.html) if opts.html else None,
+    )
+
+
+def _upgrader(repo: Repo, opts: argparse.Namespace):
+    if not opts.lsp:
+        return None
+    from .lsp.resolve import AsyncUpgrader
+    from .lsp.session import Sessions
+
+    return AsyncUpgrader(Sessions(repo.root), repo.root)
+
+
 def _revision_hint(repo: Repo, spec: str | None, error: str) -> str:
     """Explain a revision git rejected, in terms of what the user typed.
 
@@ -165,6 +312,21 @@ def _revision_hint(repo: Repo, spec: str | None, error: str) -> str:
             "commit with 'scopia <sha>'."
         )
     return "Check the revision exists: git log --oneline -5"
+
+
+def _refine(repo: Repo, graph: Graph) -> Graph:
+    from .lsp.resolve import upgrade
+    from .lsp.session import Sessions
+
+    sessions = Sessions(repo.root)
+    try:
+        refined, stats = upgrade(graph, sessions, repo.root)
+    finally:
+        sessions.close()  # never leave a server running behind a one-shot command
+    print(f"scopia: {stats.summary()} ({stats.seconds:.1f}s)", file=sys.stderr)
+    for note in stats.notes:
+        print(f"scopia: {note}", file=sys.stderr)
+    return refined
 
 
 def _below_gate(graph: Graph) -> bool:

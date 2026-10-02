@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timezone
 
 from ..graph.model import CALL, Graph, Node, is_uncertain
+from ..watch.fresh import DEFAULT_TTL as FRESH_TTL
 from . import layout as layout_mod
 
 _HI_FAN_IN = 5
@@ -21,13 +22,13 @@ _MAX_LABEL = 40
 _WHY = {
     "ambiguous": "several definitions share this name",
     "inferred": "receiver type unknown — matched by name only",
-    "heuristic": "referenced as a string, not called directly",
+    "heuristic": "passed as a reference, not called directly",
     "static": "",
+    "resolved": "confirmed by the language server",
 }
 
 
-def render(graph: Graph, *, title: str = "scopia") -> str:
-    lay = layout_mod.compute(graph)
+def render(graph: Graph, *, title: str = "scopia", live_version: int | None = None) -> str:
     touched = graph.touched
     new_files = {n.path for n in touched if n.added}
     all_files = {n.path for n in touched}
@@ -39,18 +40,42 @@ def render(graph: Graph, *, title: str = "scopia") -> str:
     else:
         subtitle = "What changed, and what it reaches."
 
+    parts = bundle(graph)
     return _PAGE.format(
         title=html.escape(title),
         subtitle=html.escape(subtitle),
-        stats=_stats(graph, touched),
-        sidebar=_sidebar(touched),
-        svg=_svg(graph, lay),
+        stats=parts["stats"],
+        sidebar=parts["sidebar"],
+        svg=parts["svg"],
         data=_payload(graph),
+        fresh_ms=int(FRESH_TTL * 1000),
         stamp=datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC"),
         hot=_HI_FAN_IN,
-        footnote=_footnote(graph),
-        banner=_banner(graph),
+        footnote=parts["footnote"],
+        banner=parts["banner"],
+        live=(
+            f'<meta name="scopia-live" content="{live_version}">'
+            if live_version is not None
+            else ""
+        ),
     )
+
+
+def bundle(graph: Graph) -> dict:
+    """Every piece of the page that changes between redraws, as strings plus the payload.
+
+    The live page swaps these in place rather than reloading, so scroll position and the
+    selected node survive. Static and live pages share this, so they cannot drift apart.
+    """
+    touched = graph.touched
+    return {
+        "stats": _stats(graph, touched),
+        "sidebar": _sidebar(touched),
+        "svg": _svg(graph, layout_mod.compute(graph)),
+        "banner": _banner(graph),
+        "footnote": _footnote(graph),
+        "data": json.loads(_payload(graph)),
+    }
 
 
 def _stats(graph: Graph, touched: list[Node]) -> str:
@@ -133,6 +158,7 @@ def _payload(graph: Graph) -> str:
             "approx": n.fan_in_shared,
             "hin": n.hidden_in,
             "hout": n.hidden_out,
+            "fresh": n.fresh,
         }
         for n in graph.nodes
     }
@@ -273,6 +299,7 @@ _PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+{live}
 <style>
 :root {{
   --bg:#fbfcfd; --surface:#fff; --panel:#f3f6f9;
@@ -341,10 +368,20 @@ aside button[aria-current="true"]{{background:var(--accent-bg);border-left-color
 .reach{{flex:none;font:10.5px var(--mono);color:var(--faint);font-style:normal}}
 .reach.hot{{color:var(--hot);font-weight:600}}
 
-main{{position:relative;overflow:auto;
+main{{position:relative;overflow:hidden;touch-action:none;cursor:grab;
   background-image:linear-gradient(var(--grid) 1px,transparent 1px),
     linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:24px 24px}}
-svg{{display:block;padding:20px}}
+main.panning{{cursor:grabbing;user-select:none}}
+svg{{display:block;width:100%;height:100%}}
+.node,.edge{{transition:opacity .5s ease}}
+.node.pre,.edge.pre{{opacity:0;pointer-events:none}}
+.zoom{{position:absolute;right:14px;bottom:14px;display:flex;gap:4px;padding:4px;
+  background:var(--surface);border:1px solid var(--line);border-radius:8px;
+  box-shadow:0 1px 4px rgba(0,0,0,.12);cursor:default}}
+.zoom button{{min-width:30px;height:28px;background:none;border:0;border-radius:5px;
+  color:var(--ink);font:600 15px var(--mono);cursor:pointer;padding:0 8px}}
+.zoom button:hover{{background:var(--panel)}}
+.zoom .txt{{font:11.5px var(--sans)}}
 
 .node{{cursor:pointer}}
 .node rect{{fill:var(--surface);stroke:var(--line);stroke-width:1.5}}
@@ -355,6 +392,9 @@ svg{{display:block;padding:20px}}
 .node.chg rect{{stroke:var(--accent);stroke-width:2;fill:var(--accent-bg)}}
 .node.new rect{{stroke:var(--new);stroke-width:2;fill:var(--new-bg)}}
 .node.ctx rect{{stroke-dasharray:4 3}}
+.node.fresh rect{{filter:drop-shadow(0 0 6px var(--new));animation:pulse 1.6s ease-in-out infinite}}
+@keyframes pulse{{50%{{filter:drop-shadow(0 0 1px var(--new))}}}}
+@media (prefers-reduced-motion:reduce){{.node.fresh rect{{animation:none}}}}
 /* Reach layers on top of state: the fill still says new/changed, the amber ring
    says "and a lot depends on it". */
 .node.reach rect{{stroke:var(--hot);stroke-width:3}}
@@ -423,8 +463,8 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
 <header>
   <h1>{title}</h1>
   <p class="sub">{subtitle}</p>
-  <div class="stats">{stats}</div>
-  {banner}
+  <div class="stats" id="stats">{stats}</div>
+  <div id="banner">{banner}</div>
 </header>
 
 <div class="shell" id="shell">
@@ -432,7 +472,12 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
     <div class="aside-h">Changed · widest reach first</div>
     <ul id="list">{sidebar}</ul>
   </aside>
-  <main id="canvas">{svg}</main>
+  <main id="canvas">{svg}<div class="zoom" id="zoom">
+    <button type="button" id="z-in" aria-label="Zoom in" title="Zoom in (+)">+</button>
+    <button type="button" id="z-out" aria-label="Zoom out" title="Zoom out (-)">&minus;</button>
+    <button type="button" id="z-fit" class="txt" title="Fit whole graph (0)">Fit</button>
+    <button type="button" id="z-play" class="txt" title="Replay the build-up animation">Replay</button>
+  </div></main>
   <section class="detail" id="detail" aria-live="polite"></section>
 </div>
 
@@ -445,13 +490,14 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
     <i><span class="dot reach"></span>called from {hot}+ places</i>
     <i class="arrow-key"><b>A&nbsp;&rarr;&nbsp;B</b> A calls B</i>
   </div>
-  <div>{footnote} Click a node to focus · Esc clears · {stamp}</div>
+  <div><span id="foot">{footnote}</span> Scroll to zoom · drag to pan · click a node to focus · Esc clears · {stamp}</div>
 </footer>
 
 <script type="application/json" id="data">{data}</script>
 <script>
 (function () {{
   var G = JSON.parse(document.getElementById("data").textContent);
+  var canvas = document.getElementById("canvas");
   var svg = document.getElementById("graph");
   var detail = document.getElementById("detail");
   var list = document.getElementById("list");
@@ -459,10 +505,14 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
   var current = null;
   var inbound = {{}}, outbound = {{}};
 
-  G.edges.forEach(function (e) {{
-    (outbound[e.src] = outbound[e.src] || []).push(e);
-    (inbound[e.dst] = inbound[e.dst] || []).push(e);
-  }});
+  function buildIndex() {{
+    inbound = {{}}; outbound = {{}};
+    G.edges.forEach(function (e) {{
+      (outbound[e.src] = outbound[e.src] || []).push(e);
+      (inbound[e.dst] = inbound[e.dst] || []).push(e);
+    }});
+  }}
+  buildIndex();
 
   function q(sel, val) {{
     var all = svg.querySelectorAll(sel), i;
@@ -483,9 +533,9 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
     for (i = 0; i < cur.length; i++) cur[i].removeAttribute("aria-current");
   }}
 
-  function focus(uid) {{
+  function focus(uid, restoring) {{
     if (!G.nodes[uid]) return;
-    if (current === uid) {{ clear(); return; }}
+    if (current === uid && !restoring) {{ clear(); return; }}
     clear();
     current = uid;
 
@@ -514,11 +564,13 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
     for (i = 0; i < buttons.length; i++) {{
       if (buttons[i].getAttribute("data-goto") === uid) {{
         buttons[i].setAttribute("aria-current", "true");
-        buttons[i].scrollIntoView({{block: "nearest"}});
+        if (!restoring) buttons[i].scrollIntoView({{block: "nearest"}});
       }}
     }}
-    if (picked && picked.scrollIntoView) {{
-      picked.scrollIntoView({{block: "center", inline: "center", behavior: "smooth"}});
+    if (picked && !restoring) {{
+      skipIntro();
+      var bb = picked.getBBox();
+      animateTo(bb.x + bb.width / 2, bb.y + bb.height / 2, Math.max(view.k, 0.85), 450);
     }}
     render(uid);
   }}
@@ -579,15 +631,15 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
     detail.querySelector(".d-close").addEventListener("click", clear);
   }}
 
-  svg.addEventListener("click", function (ev) {{
+  canvas.addEventListener("click", function (ev) {{
     var t = ev.target, g = null;
-    while (t && t !== svg) {{
+    while (t && t !== canvas) {{
       if (t.classList && t.classList.contains("node")) {{ g = t; break; }}
       t = t.parentNode;
     }}
     if (g) focus(g.getAttribute("data-uid")); else clear();
   }});
-  svg.addEventListener("keydown", function (ev) {{
+  canvas.addEventListener("keydown", function (ev) {{
     if (ev.key !== "Enter" && ev.key !== " ") return;
     var t = ev.target;
     if (t && t.classList && t.classList.contains("node")) {{
@@ -608,6 +660,340 @@ footer{{padding:10px 24px;border-top:1px solid var(--line);background:var(--surf
   document.addEventListener("keydown", function (ev) {{
     if (ev.key === "Escape") clear();
   }});
+
+  var freshTimers = [];
+  function markFresh() {{
+    // The highlight expires here rather than server-side. A republish just to drop it
+    // would swap the whole SVG, and with highlights timing out one by one that is a
+    // visible blink for every changed symbol.
+    freshTimers.forEach(clearTimeout);
+    freshTimers = [];
+    Object.keys(G.nodes).forEach(function (uid) {{
+      var el = G.nodes[uid].fresh && nodeEl(uid);
+      if (!el) return;
+      el.classList.add("fresh");
+      freshTimers.push(setTimeout(function () {{
+        el.classList.remove("fresh");
+      }}, {fresh_ms}));
+    }});
+  }}
+  markFresh();
+
+  // Live mode: swap the changing parts in place. Selection and both scroll offsets are
+  // captured first and put back after, because a panel that vanishes every time the agent
+  // saves would make the page worse than none.
+  function apply(p) {{
+    var keep = current, ly = list.scrollTop;
+    G = p.data;
+    buildIndex();
+    var known = {{nodes: {{}}, edges: {{}}}}, todo = {{nodes: {{}}, edges: {{}}}};
+    Array.prototype.forEach.call(svg.querySelectorAll(".node"), function (n) {{
+      var u = n.getAttribute("data-uid"); known.nodes[u] = true;
+      if (n.classList.contains("pre")) todo.nodes[u] = true;
+    }});
+    Array.prototype.forEach.call(svg.querySelectorAll(".edge"), function (e) {{
+      var k = edgeKey(e); known.edges[k] = true;
+      if (e.classList.contains("pre")) todo.edges[k] = true;
+    }});
+    introToken++; introRunning = false;
+    svg.outerHTML = p.svg;
+    svg = document.getElementById("graph");
+    readSize();
+    paint();
+    list.innerHTML = p.sidebar;
+    document.getElementById("stats").innerHTML = p.stats;
+    document.getElementById("banner").innerHTML = p.banner;
+    document.getElementById("foot").innerHTML = p.footnote;
+    current = null;
+    shell.classList.remove("open");
+    if (keep && G.nodes[keep]) focus(keep, true); else clear();
+    markFresh();
+    list.scrollTop = ly;
+    // Animate only what this update added (plus anything an earlier, interrupted walk had
+    // not reached yet); everything already on screen stays put.
+    var add = {{nodes: todo.nodes, edges: todo.edges}}, any = false;
+    Array.prototype.forEach.call(svg.querySelectorAll(".node"), function (n) {{
+      var u = n.getAttribute("data-uid");
+      if (!known.nodes[u]) add.nodes[u] = true;
+      if (add.nodes[u]) any = true;
+    }});
+    Array.prototype.forEach.call(svg.querySelectorAll(".edge"), function (e) {{
+      var k = edgeKey(e);
+      if (!known.edges[k]) add.edges[k] = true;
+      if (add.edges[k]) any = true;
+    }});
+    if (any) startIntro(add);
+  }}
+
+
+  // ---- Zoom, pan and the build-up animation -------------------------------------------
+  // The view is a centre point plus a scale; it is applied by rewriting the viewBox, so
+  // text stays crisp at every zoom level.
+  var view = {{cx: 0, cy: 0, k: 1}}, gw = 1, gh = 1, tween = 0, introToken = 0;
+  var K_MIN = 0.05, K_MAX = 6;
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function readSize() {{
+    var vb = (svg.getAttribute("viewBox") || "0 0 1 1").split(/[ ,]+/);
+    gw = parseFloat(vb[2]) || 1; gh = parseFloat(vb[3]) || 1;
+    svg.setAttribute("data-w", gw); svg.setAttribute("data-h", gh);
+  }}
+  function paint() {{
+    var w = canvas.clientWidth / view.k, h = canvas.clientHeight / view.k;
+    svg.setAttribute("viewBox", (view.cx - w / 2) + " " + (view.cy - h / 2) + " " + w + " " + h);
+  }}
+  function clampK(k) {{ return Math.min(K_MAX, Math.max(K_MIN, k)); }}
+  function fitView() {{
+    var k = Math.min(canvas.clientWidth / (gw + 40), canvas.clientHeight / (gh + 40), 1);
+    return {{cx: gw / 2, cy: gh / 2, k: clampK(k)}};
+  }}
+  function animateTo(cx, cy, k, ms) {{
+    var id = ++tween, from = {{cx: view.cx, cy: view.cy, k: view.k}}, t0 = null;
+    k = clampK(k);
+    if (!ms) {{ view = {{cx: cx, cy: cy, k: k}}; paint(); return Promise.resolve(); }}
+    return new Promise(function (done) {{
+      function step(t) {{
+        if (id !== tween) return done();
+        if (t0 === null) t0 = t;
+        var f = Math.min(1, (t - t0) / ms);
+        f = f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2;
+        // Interpolate scale geometrically so zooming feels even.
+        view.k = from.k * Math.pow(k / from.k, f);
+        view.cx = from.cx + (cx - from.cx) * f;
+        view.cy = from.cy + (cy - from.cy) * f;
+        paint();
+        if (f < 1) requestAnimationFrame(step); else done();
+      }}
+      requestAnimationFrame(step);
+    }});
+  }}
+  function zoomAt(factor, px, py) {{
+    tween++;
+    var nk = clampK(view.k * factor);
+    var dx = px - canvas.clientWidth / 2, dy = py - canvas.clientHeight / 2;
+    view.cx += dx / view.k - dx / nk;
+    view.cy += dy / view.k - dy / nk;
+    view.k = nk;
+    paint();
+  }}
+  function zoomCentre(factor) {{ zoomAt(factor, canvas.clientWidth / 2, canvas.clientHeight / 2); }}
+
+  canvas.addEventListener("wheel", function (ev) {{
+    ev.preventDefault();
+    skipIntro();
+    var r = canvas.getBoundingClientRect();
+    zoomAt(Math.exp(-ev.deltaY * (ev.ctrlKey ? 0.01 : 0.0015)), ev.clientX - r.left, ev.clientY - r.top);
+  }}, {{passive: false}});
+
+  var drag = null, dragged = false;
+  canvas.addEventListener("click", function (ev) {{
+    if (dragged) {{ dragged = false; ev.stopImmediatePropagation(); ev.preventDefault(); }}
+  }}, true);
+  canvas.addEventListener("pointerdown", function (ev) {{
+    if (ev.button !== 0 || ev.target.closest(".zoom")) return;
+    drag = {{x: ev.clientX, y: ev.clientY, id: ev.pointerId, on: false}};
+  }});
+  canvas.addEventListener("pointermove", function (ev) {{
+    if (!drag || ev.pointerId !== drag.id) return;
+    var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (!drag.on) {{
+      if (Math.abs(dx) + Math.abs(dy) < 5) return;
+      drag.on = true; dragged = true; tween++; skipIntro();
+      canvas.classList.add("panning");
+      try {{ canvas.setPointerCapture(ev.pointerId); }} catch (e) {{}}
+    }}
+    view.cx -= dx / view.k; view.cy -= dy / view.k;
+    drag.x = ev.clientX; drag.y = ev.clientY;
+    paint();
+  }});
+  function endDrag(ev) {{
+    if (!drag || ev.pointerId !== drag.id) return;
+    drag = null;
+    canvas.classList.remove("panning");
+    // A drag that ends off any element yields no click; don't leave the flag armed.
+    setTimeout(function () {{ dragged = false; }}, 0);
+  }}
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  document.getElementById("z-in").addEventListener("click", function () {{ skipIntro(); zoomCentre(1.35); }});
+  document.getElementById("z-out").addEventListener("click", function () {{ skipIntro(); zoomCentre(1 / 1.35); }});
+  document.getElementById("z-fit").addEventListener("click", function () {{
+    skipIntro(); var f = fitView(); animateTo(f.cx, f.cy, f.k, 400);
+  }});
+  document.getElementById("z-play").addEventListener("click", function () {{ startIntro(); }});
+  document.addEventListener("keydown", function (ev) {{
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (ev.key === "+" || ev.key === "=") zoomCentre(1.35);
+    else if (ev.key === "-" || ev.key === "_") zoomCentre(1 / 1.35);
+    else if (ev.key === "0") {{ var f = fitView(); animateTo(f.cx, f.cy, f.k, 400); }}
+  }});
+  if (window.ResizeObserver) new ResizeObserver(paint).observe(canvas);
+  else window.addEventListener("resize", paint);
+
+  function sleep(ms) {{ return new Promise(function (r) {{ setTimeout(r, ms); }}); }}
+  function revealAll() {{
+    var hidden = svg.querySelectorAll(".pre"), i;
+    for (i = 0; i < hidden.length; i++) {{
+      hidden[i].classList.remove("pre");
+      hidden[i].style.strokeDasharray = ""; hidden[i].style.strokeDashoffset = "";
+      hidden[i].style.transition = "";
+    }}
+  }}
+  function skipIntro() {{
+    if (!introRunning) return;
+    introToken++;
+    revealAll();
+    introRunning = false;
+    document.getElementById("z-play").textContent = "Replay";
+  }}
+  var introRunning = false;
+
+  // A follow-through walk: the camera sits zoomed on a node, then travels along an edge
+  // (drawing it as it goes) to the next connected node, which appears on arrival. The walk
+  // is depth-first from the entry points, so it reads like someone tracing the call path.
+  function edgeKey(e) {{ return e.getAttribute("data-src") + ">" + e.getAttribute("data-dst"); }}
+
+  // `only` ({{nodes, edges}} key sets) limits the walk to what is new, so a live update
+  // animates just its additions and leaves the rest of the graph standing.
+  async function startIntro(only) {{
+    introRunning = false; introToken++;
+    revealAll();
+    var token = ++introToken;
+    var nodes = Array.prototype.slice.call(svg.querySelectorAll(".node"));
+    var edges = Array.prototype.slice.call(svg.querySelectorAll(".edge"));
+    var allNodes = nodes;
+    if (only) {{
+      nodes = nodes.filter(function (n) {{ return only.nodes[n.getAttribute("data-uid")]; }});
+      edges = edges.filter(function (e) {{ return only.edges[edgeKey(e)]; }});
+    }}
+    if (!nodes.length) return;
+    var byUid = {{}}, boxes = {{}};
+    var allBox = {{}};
+    allNodes.forEach(function (n) {{ allBox[n.getAttribute("data-uid")] = n.getBBox(); }});
+    nodes.forEach(function (n) {{
+      var u = n.getAttribute("data-uid"); byUid[u] = n; boxes[u] = allBox[u];
+    }});
+    function pos(a, b) {{ return boxes[a].x - boxes[b].x || boxes[a].y - boxes[b].y; }}
+    var uids = Object.keys(byUid).sort(pos);
+
+    // Order: depth-first over outgoing edges, entry points (no callers drawn) first.
+    var out = {{}}, hasIn = {{}};
+    edges.forEach(function (e) {{
+      var s = e.getAttribute("data-src"), d = e.getAttribute("data-dst");
+      if (!byUid[d]) return;
+      (out[s] = out[s] || []).push({{dst: d, el: e}});
+      if (byUid[s]) hasIn[d] = true;
+    }});
+    // A new node reached from one already on screen starts its walk along that edge.
+    var viaFrom = {{}};
+    edges.forEach(function (e) {{
+      var s = e.getAttribute("data-src"), d = e.getAttribute("data-dst");
+      if (byUid[d] && !byUid[s] && allBox[s] && !viaFrom[d]) viaFrom[d] = e;
+    }});
+    var seen = {{}}, steps = [];
+    function walk(u, via) {{
+      if (seen[u]) return;
+      seen[u] = true;
+      steps.push({{uid: u, via: via}});
+      (out[u] || []).slice().sort(function (x, y) {{ return pos(x.dst, y.dst); }})
+        .forEach(function (c) {{ if (!seen[c.dst]) walk(c.dst, c.el); }});
+    }}
+    uids.filter(function (u) {{ return !hasIn[u]; }}).forEach(function (u) {{ walk(u, viaFrom[u] || null); }});
+    uids.forEach(function (u) {{ walk(u, viaFrom[u] || null); }});
+
+    var scale = Math.max(0.45, Math.min(1, 150000 / (steps.length * 2400 + edges.length * 700)));
+    var HOLD = 800 * scale, TRAVEL = 1300 * scale, SIDE = 800 * scale, ZOOM = 1.25;
+    nodes.concat(edges).forEach(function (el) {{ el.classList.add("pre"); }});
+    var btn = document.getElementById("z-play");
+    btn.textContent = "Skip";
+    introRunning = true;
+    var shown = {{}};
+    allNodes.forEach(function (n) {{
+      var u = n.getAttribute("data-uid"); if (!byUid[u]) shown[u] = true;
+    }});
+    function alive() {{ return token === introToken; }}
+    function centre(u) {{ var b = boxes[u]; return [b.x + b.width / 2, b.y + b.height / 2]; }}
+    function drawEdge(e, ms) {{
+      if (e.classList.contains("e-call") && e.getTotalLength) {{
+        var len = e.getTotalLength();
+        e.style.transition = "none";
+        e.style.strokeDasharray = len; e.style.strokeDashoffset = len;
+        e.classList.remove("pre");
+        e.getBoundingClientRect();
+        e.style.transition = "stroke-dashoffset " + ms + "ms ease-in-out";
+        e.style.strokeDashoffset = 0;
+      }} else {{
+        e.classList.remove("pre");
+      }}
+      setTimeout(function () {{
+        e.style.strokeDasharray = ""; e.style.strokeDashoffset = ""; e.style.transition = "";
+      }}, ms + 50);
+    }}
+
+    // Open on the first node, already zoomed in.
+    var first = steps[0], c0 = centre(first.uid);
+    if (first.via) {{
+      var sb = allBox[first.via.getAttribute("data-src")];
+      if (sb) c0 = [sb.x + sb.width / 2, sb.y + sb.height / 2];
+    }}
+    await animateTo(c0[0], c0[1], ZOOM, 900);
+    for (var i = 0; i < steps.length; i++) {{
+      if (!alive()) return;
+      var st = steps[i], c = centre(st.uid);
+      if (i > 0 || st.via) {{
+        // Travel (drawing the connecting edge on the way) to the next node.
+        if (st.via) drawEdge(st.via, TRAVEL * 0.9);
+        await animateTo(c[0], c[1], ZOOM, TRAVEL);
+        if (!alive()) return;
+      }}
+      byUid[st.uid].classList.remove("pre");
+      shown[st.uid] = true;
+      await sleep(HOLD);
+      if (!alive()) return;
+
+      // Any other edge that now joins two visible nodes, one at a time, camera staying put.
+      var extra = edges.filter(function (e) {{
+        var s = e.getAttribute("data-src"), d = e.getAttribute("data-dst");
+        return e.classList.contains("pre") && shown[s] && shown[d] && (s === st.uid || d === st.uid);
+      }});
+      for (var j = 0; j < extra.length; j++) {{
+        drawEdge(extra[j], SIDE);
+        await sleep(SIDE + 150);
+        if (!alive()) return;
+      }}
+    }}
+    revealAll();
+    introRunning = false;
+    btn.textContent = "Replay";
+    await sleep(500);
+    if (!alive()) return;
+    var f = fitView();
+    animateTo(f.cx, f.cy, f.k, 1200);
+  }}
+
+  readSize();
+  (function () {{ var f = fitView(); view = f; paint(); }})();
+  // Plays once per page load, including live mode; later live redraws keep the view as is.
+  startIntro();
+
+  if (document.querySelector('meta[name="scopia-live"]')) {{
+    // Seeded from the page itself, so a change landing between render and first poll is
+    // not mistaken for the baseline.
+    var version = document.querySelector('meta[name="scopia-live"]').content, busy = false;
+    setInterval(function () {{
+      if (busy) return;
+      busy = true;
+      fetch("/version", {{cache: "no-store"}}).then(function (r) {{ return r.text(); }})
+        .then(function (v) {{
+          if (v === version) return;
+          return fetch("/graph.json", {{cache: "no-store"}}).then(function (r) {{ return r.json(); }})
+            .then(function (p) {{ version = String(p.version); apply(p); }});
+        }})
+        .catch(function () {{ /* server gone or restarting; try again next tick */ }})
+        .then(function () {{ busy = false; }});
+    }}, 1000);
+  }}
 }})();
 </script>
 </body></html>

@@ -33,6 +33,7 @@ _FUNC_DECLS = ("function_definition", "method_declaration")
 
 class PhpAdapter:
     name = "php"
+    grammar = "php"
     extensions = (".php", ".phtml")
 
     def extract(self, source: bytes) -> FileFacts:

@@ -39,6 +39,15 @@ Two rules matter:
 Then register it in `scopia/lang/__init__.py::_registry`, and add a fixture repo under
 `tests/fixtures/` covering the four shapes (`py_repo.py` is the reference).
 
+A language that needs more than one grammar registers one instance per grammar and
+gives them all the same `name` — `react.py` does this for `.js`, `.ts` and `.tsx`.
+`name` is what stops a call crossing a language boundary, so two grammars parsing one
+language must agree on it, or every import between them is dropped as a false edge.
+
+Give the adapter a `grammar` attribute naming its tree-sitter grammar. Watch mode uses it
+to tell a finished file from a half-written one: tree-sitter never raises on bad input, so
+without it a syntax error looks identical to "no symbols".
+
 Grammars should ship pre-built abi3 wheels. A dependency that needs a C toolchain at
 install time breaks the "download and run" promise for exactly the people this tool is
 for.

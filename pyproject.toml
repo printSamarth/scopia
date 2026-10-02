@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "scopia"
-version = "0.1.0"
+version = "1.0.0"
 description = "See the shape of a code change before reading its lines."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "Samarth" }]
-keywords = ["code-review", "diff", "call-graph", "static-analysis", "git"]
+authors = [{ name = "Samarth Patel" }]
+keywords = ["code-review", "diff", "call-graph", "static-analysis", "git", "react", "java"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
@@ -25,15 +25,22 @@ classifiers = [
 ]
 
 # Kept deliberately small. Every dependency is a way for `pip install` to fail on
-# someone else's machine, and all three of these ship abi3 wheels, so no compiler
+# someone else's machine, and every one of these ships abi3 wheels, so no compiler
 # is needed at install time.
 dependencies = [
   "tree-sitter>=0.23,<0.27",
   "tree-sitter-python>=0.23",
   "tree-sitter-php>=0.23",
+  "tree-sitter-java>=0.23",
+  # `.js`/`.jsx` and `.ts`/`.tsx` need separate grammars for the same reason
+  # TypeScript ships two parsers: `<T>value` is a cast in one, an element in the other.
+  "tree-sitter-javascript>=0.23",
+  "tree-sitter-typescript>=0.23",
 ]
 
 [project.optional-dependencies]
+# Optional: `scopia --lsp` uses it to confirm name-matched calls. Pure Python, no Node.
+lsp = ["jedi-language-server>=0.40"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
@@ -45,6 +52,11 @@ Issues = "https://github.com/printSamarth/scopia/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["scopia"]
+
+[tool.hatch.build.targets.sdist]
+# The README points at GitHub for images, so shipping them would add 4MB to every
+# source install for nothing. Tests ship: they are how someone verifies a build.
+exclude = ["docs", ".github"]
 
 [tool.ruff]
 line-length = 100

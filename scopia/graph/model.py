@@ -7,6 +7,7 @@ allowed to *look* certain when it isn't.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 # Edge provenance — how the edge was established.
 STATIC = "static"  # an unqualified call with exactly one definition; high confidence
@@ -14,6 +15,7 @@ AMBIGUOUS = "ambiguous"  # several candidates (interface, duck typing, reflectio
 INFERRED = "inferred"  # matched by name through a receiver whose type is unknown
 HEURISTIC = "heuristic"  # a string callable, framework wiring, DI
 TRACED = "traced"  # observed in a real run (phase 5)
+RESOLVED = "resolved"  # a language server named the definition; as certain as it gets
 
 #: Provenances that must never be drawn as a confident, solid edge.
 UNCERTAIN = frozenset({AMBIGUOUS, INFERRED, HEURISTIC})
@@ -65,6 +67,12 @@ class Node:
     hidden_in: int = 0
     hidden_out: int = 0
     pre_existing: bool = False
+    fresh: bool = False
+    """Arrived or changed since the last redraw in watch mode. Transient display state —
+    deliberately absent from `Graph.to_dict`, so it never leaks into golden tests."""
+    is_entry: bool = False
+    """Nothing in the repo calls this, so something outside does — an HTTP route, a
+    scheduler, a CLI entry. These are where a reader's eye should start."""
     """The symbol was already there before this diff — so this edits behaviour
     that other code may already depend on, rather than adding something new."""
     """The file did not exist before — "N lines changed" would misdescribe it."""
@@ -107,6 +115,8 @@ class Graph:
     nothing about these, and silence would read as "nothing changed here"."""
     files_indexed: int = 0
     files_parsed: int = 0
+    index: Any = field(default=None, repr=False, compare=False)
+    """The RepoIndex this graph was built from, kept so a resolver can refine it later."""
 
     @property
     def touched(self) -> list[Node]:
@@ -139,6 +149,7 @@ class Graph:
                     "gone": n.gone,
                     "added": n.added,
                     "pre_existing": n.pre_existing,
+                    "is_entry": n.is_entry,
                     "hidden_in": n.hidden_in,
                     "hidden_out": n.hidden_out,
                 }

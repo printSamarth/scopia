@@ -92,6 +92,28 @@ class Repo:
         out = _run(self.root, "ls-files", "--others", "--exclude-standard", "-z")
         return [p for p in out.split("\0") if p]
 
+    def dirty_paths(self) -> list[str]:
+        """Every path with uncommitted state, untracked files listed individually.
+
+        One cheap call (~10ms), which is what makes polling affordable. `-uall` matters:
+        without it a new directory is reported as one entry and the files an agent just
+        wrote inside it are invisible.
+        """
+        out = _run(self.root, "status", "--porcelain", "-z", "-uall")
+        entries = out.split("\0")
+        paths: list[str] = []
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            paths.append(entry[3:])
+            # Renames and copies carry the old path as an extra NUL-separated field.
+            if entry[0] in "RC" or entry[1] in "RC":
+                i += 1
+        return paths
+
     def working_tree_shas(self) -> dict[str, str]:
         """Blob SHA for every tracked file, in two git calls rather than one per file.
 
@@ -119,21 +141,38 @@ class Repo:
         pending = modified + [p for p in self.untracked_files() if p not in shas]
         if pending:
             shas.update(self._hash_batch(pending))
-        return shas
+        # A file deleted from the working tree still has an index entry, so it would
+        # otherwise report its old hash and look untouched. Dropping it lets callers see
+        # the deletion by its absence.
+        return {path: sha for path, sha in shas.items() if (self.root / path).is_file()}
 
     def _hash_batch(self, paths: list[str]) -> dict[str, str]:
+        """Content hashes for paths that exist on disk.
+
+        Deleted files are dropped first: `git hash-object` fails on a missing path and
+        takes the whole batch down with it, which silently reverted every *other*
+        modified file to its stale index hash. Those hashes key the fact cache, so one
+        deletion poisoned the analysis of every edited file in the tree.
+        """
+        present = [p for p in paths if (self.root / p).is_file()]
+        if not present:
+            return {}
         try:
             proc = subprocess.run(
                 ["git", "hash-object", "--stdin-paths"],
                 cwd=str(self.root),
-                input="\n".join(paths).encode(),
+                input="\n".join(present).encode(),
                 capture_output=True,
                 check=True,
             )
         except (OSError, subprocess.CalledProcessError):
             return {}
         hashes = proc.stdout.decode().split()
-        return dict(zip(paths, hashes, strict=False))
+        if len(hashes) != len(present):
+            # A partial result would pair hashes with the wrong paths. Report nothing
+            # rather than something quietly wrong.
+            return {}
+        return dict(zip(present, hashes, strict=True))
 
     def read_many(self, rev: str | None, paths: list[str]) -> dict[str, bytes]:
         """Read many blobs in one git call.

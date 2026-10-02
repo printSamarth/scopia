@@ -7,7 +7,7 @@ import pytest
 
 from scopia.vcs.git import Repo
 
-from .fixtures import php_repo, py_repo
+from .fixtures import php_repo, py_repo, react_repo
 
 
 def _git(root: Path, *args: str) -> None:
@@ -44,19 +44,30 @@ def php_fixture(tmp_path_factory) -> Repo:
 
 
 @pytest.fixture(scope="session")
+def react_fixture(tmp_path_factory) -> Repo:
+    return _make_repo(
+        tmp_path_factory, "reactrepo", react_repo.base_files(), react_repo.head_files()
+    )
+
+
+@pytest.fixture(scope="session")
 def mixed_fixture(tmp_path_factory) -> Repo:
-    """Python and PHP sharing symbol names — they must never be linked to each other."""
+    """Python, PHP and React sharing symbol names — never linked to each other."""
     base = {
         "tool.py": "def load(x):\n    return connect(x)\n\n\ndef connect(x):\n    return x\n",
         "Db.php": "<?php\n\nclass Db\n{\n    public function connect($dsn)\n    {\n"
         "        return $dsn;\n    }\n\n    public function load($k)\n    {\n"
         "        return $this->connect($k);\n    }\n}\n",
+        "db.ts": "export function connect(dsn) {\n  return dsn;\n}\n\n"
+        "export function load(k) {\n  return connect(k);\n}\n",
     }
     head = {
         "tool.py": "def load(x):\n    return connect(x * 2)\n\n\ndef connect(x):\n    return x\n",
         "Db.php": "<?php\n\nclass Db\n{\n    public function connect($dsn)\n    {\n"
         "        return $dsn;\n    }\n\n    public function load($k)\n    {\n"
         "        return $this->connect($k . '!');\n    }\n}\n",
+        "db.ts": "export function connect(dsn) {\n  return dsn;\n}\n\n"
+        "export function load(k) {\n  return connect(`${k}!`);\n}\n",
     }
     return _make_repo(tmp_path_factory, "mixedrepo", base, head)
 
@@ -167,6 +178,54 @@ def untracked_fixture(tmp_path_factory) -> Repo:
     (root / "ignored.log").write_text("noise\n", "utf-8")
     (root / ".gitignore").write_text("*.log\n", "utf-8")
     return Repo(root)
+
+
+@pytest.fixture(scope="session")
+def entry_fixture(tmp_path_factory) -> Repo:
+    """A one-line change four levels below two different triggers."""
+    base = {
+        "app/util.py": "def fmt(x):\n    return str(x)\n",
+        "app/repo.py": "from app.util import fmt\n\n\ndef load(i):\n    return fmt(i)\n",
+        "app/service.py": "from app.repo import load\n\n\ndef fetch(i):\n    return load(i)\n",
+        "app/controller.py": (
+            "from app.service import fetch\n\n\nclass OrderController:\n"
+            "    def show(self, i):\n        return fetch(i)\n"
+        ),
+        "app/job.py": (
+            "from app.service import fetch\n\n\n"
+            "def nightly_sync():\n    return fetch(0)\n"
+        ),
+    }
+    head = dict(base)
+    head["app/util.py"] = "def fmt(x):\n    return str(x).strip()\n"
+    return _make_repo(tmp_path_factory, "entrypt", base, head)
+
+
+@pytest.fixture(scope="session")
+def import_fixture(tmp_path_factory) -> Repo:
+    """Two same-named functions, reached three ways: plain import, package, relative."""
+    base = {
+        "app/__init__.py": "",
+        "app/orders.py": "def render(p):\n    return ['orders', p]\n",
+        "app/users.py": "def render(p):\n    return ['users', p]\n",
+        "app/pkg/__init__.py": "def helper(x):\n    return x\n",
+        "app/other.py": "def helper(x):\n    return -x\n",
+        "app/view.py": "def placeholder():\n    return None\n",
+    }
+    head = dict(base)
+    head["app/view.py"] = (
+        "from app.users import render\n"
+        "from app.pkg import helper\n"
+        "\n\n"
+        "def show_users(rows):\n    return render(rows)\n"
+        "\n\n"
+        "def show_pkg(x):\n    return helper(x)\n"
+        "\n\n"
+    )
+    head["app/rel_view.py"] = (
+        "from .orders import render\n\n\ndef show_rel(x):\n    return render(x)\n"
+    )
+    return _make_repo(tmp_path_factory, "importfx", base, head)
 
 
 @pytest.fixture(scope="session")

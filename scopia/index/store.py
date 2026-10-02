@@ -15,7 +15,7 @@ from ..lang.base import CallSite, FileFacts, SymbolDef, TypeRef
 
 # Bump when the serialized shape or extraction logic changes; old entries are then
 # simply never read again.
-SCHEMA = "v3"
+SCHEMA = "v5"
 
 
 class FactsStore:
@@ -51,7 +51,7 @@ def _encode(facts: FileFacts) -> dict:
             [d.name, d.qualname, d.kind, d.start_line, d.end_line, d.parent, d.has_body]
             for d in facts.defs
         ],
-        "c": [[c.callee, c.line, c.caller, c.form, c.scope] for c in facts.calls],
+        "c": [[c.callee, c.line, c.caller, c.form, c.scope, c.module] for c in facts.calls],
         "b": [[b.holder, b.base] for b in facts.bases],
     }
 
@@ -63,8 +63,8 @@ def _decode(raw: dict) -> FileFacts:
             for n, q, k, s, e, p, b in raw.get("d", ())
         ),
         calls=tuple(
-            CallSite(callee=c, line=n, caller=w, form=f, scope=sc)
-            for c, n, w, f, sc in raw.get("c", ())
+            CallSite(callee=c, line=n, caller=w, form=f, scope=sc, module=m)
+            for c, n, w, f, sc, m in raw.get("c", ())
         ),
         bases=tuple(TypeRef(holder=h, base=b) for h, b in raw.get("b", ())),
     )

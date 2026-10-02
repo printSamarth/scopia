@@ -23,6 +23,22 @@ def parser_for(language_id: str) -> tree_sitter.Parser:
         import tree_sitter_php
 
         raw = tree_sitter_php.language_php()
+    elif language_id == "java":
+        import tree_sitter_java
+
+        raw = tree_sitter_java.language()
+    elif language_id == "javascript":
+        import tree_sitter_javascript
+
+        raw = tree_sitter_javascript.language()
+    elif language_id == "typescript":
+        import tree_sitter_typescript
+
+        raw = tree_sitter_typescript.language_typescript()
+    elif language_id == "tsx":
+        import tree_sitter_typescript
+
+        raw = tree_sitter_typescript.language_tsx()
     else:  # pragma: no cover - guarded by the registry
         raise ValueError(f"no grammar for {language_id}")
     return tree_sitter.Parser(tree_sitter.Language(raw))

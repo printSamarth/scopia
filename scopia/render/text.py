@@ -14,7 +14,7 @@ _HI_FAN_IN = 5
 _WHY = {
     "ambiguous": "several definitions share this name",
     "inferred": "receiver type unknown; matched by name only",
-    "heuristic": "referenced as a string, not called directly",
+    "heuristic": "passed as a reference, not called directly",
 }
 
 
@@ -249,7 +249,8 @@ def _chain(
                 ambiguous[key] = ambiguous.get(key, 0) + 1
 
     for name, count in sorted(ambiguous.items()):
-        out.append(f"{indent}   {s.dim('?')}  {name} {s.dim(f'→ {count} candidates')}")
+        word = "candidate" if count == 1 else "candidates"
+        out.append(f"{indent}   {s.dim('?')}  {name} {s.dim(f'→ {count} {word}')}")
 
     for edge in sorted(edges, key=lambda e: (e.order or 99, e.dst)):
         target = by_uid.get(edge.dst)
@@ -281,6 +282,9 @@ def _has_static_calls(outgoing: dict[str, list[Edge]], uid: str) -> bool:
 def _node_line(s: _Style, node: Node) -> str:
     label = node.display if node.touched else s.dim(node.display)
     bits = []
+    if node.fresh:
+        # Watch mode only: arrived or changed since the last redraw.
+        bits.append(s.bold(s.accent("● just now")))
     if node.touched:
         if node.added:
             bits.append(s.accent("new"))
@@ -299,6 +303,8 @@ def _node_line(s: _Style, node: Node) -> str:
     hidden = node.hidden_in + node.hidden_out
     if hidden:
         bits.append(s.warn(f"+{hidden} hidden"))
+    if node.is_entry:
+        bits.append(s.accent("entry point"))
     if not node.touched:
         bits.append(s.dim("context"))
     meta = s.dim("  " + " · ".join(bits)) if bits else ""

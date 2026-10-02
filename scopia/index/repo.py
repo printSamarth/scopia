@@ -33,6 +33,13 @@ DEFAULT_EXCLUDES = (
     "dist/*",
     "build/*",
     "*.min.js",
+    # JavaScript build output. `dist/` and `build/` above already cover most of it;
+    # these are the framework-specific ones that sit beside the source instead.
+    ".next/*",
+    "*/.next/*",
+    "coverage/*",
+    "*.bundle.js",
+    "*.chunk.js",
 )
 
 
@@ -50,17 +57,22 @@ class RepoIndex:
     path_of: dict[str, str] = field(default_factory=dict)
     lang_of: dict[str, str] = field(default_factory=dict)
     by_name: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
-    callees_of: dict[str, list[tuple[str, str, str]]] = field(
+    callees_of: dict[str, list[tuple[str, str, str, str]]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    """caller uid -> [(callee name, call form, named class)]."""
-    callers_of_name: dict[str, list[tuple[str, str, str]]] = field(
+    """caller uid -> [(callee name, call form, named class, imported-from module)]."""
+    callers_of_name: dict[str, list[tuple[str, str, str, str]]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    """callee name -> [(caller uid, call form, named class)]."""
+    """callee name -> [(caller uid, call form, named class, imported-from module)]."""
     bases_of: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     files_indexed: int = 0
     files_parsed: int = 0
+    call_lines: dict[tuple[str, str], list[int]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    """(caller uid, callee name) -> lines of its call sites; lets a language server be
+    asked about the exact position."""
 
     def add_file(self, path: str, facts: FileFacts) -> None:
         self.files_indexed += 1
@@ -76,8 +88,9 @@ class RepoIndex:
             if c.caller is None:
                 continue
             caller_uid = uid(path, c.caller)
-            self.callees_of[caller_uid].append((c.callee, c.form, c.scope))
-            self.callers_of_name[c.callee].append((caller_uid, c.form, c.scope))
+            self.callees_of[caller_uid].append((c.callee, c.form, c.scope, c.module))
+            self.callers_of_name[c.callee].append((caller_uid, c.form, c.scope, c.module))
+            self.call_lines[(caller_uid, c.callee)].append(c.line)
         for b in facts.bases:
             self.bases_of[uid(path, b.holder)].append(b.base)
 
@@ -95,7 +108,26 @@ class RepoIndex:
         definition = self.defs.get(symbol_uid)
         if definition is None:
             return 0
-        return len({c for c, _f, _s in self.callers_of_name.get(definition.name, ())})
+        return len({c for c, _f, _s, _m in self.callers_of_name.get(definition.name, ())})
+
+    def fan_in_outside(self, symbol_uid: str, changed: frozenset[str]) -> int:
+        """Callers that are *not* part of the change under review.
+
+        Plumbing means "everything already called this, so it says nothing about the
+        change". When the change itself is what made a symbol popular — twenty new
+        handlers all calling one service — the opposite is true: it is the shape of the
+        change, and counting those callers would hide the very node that connects it.
+        """
+        definition = self.defs.get(symbol_uid)
+        if definition is None:
+            return 0
+        return len(
+            {
+                c
+                for c, _f, _s, _m in self.callers_of_name.get(definition.name, ())
+                if c not in changed
+            }
+        )
 
     def fan_in_is_shared(self, symbol_uid: str) -> bool:
         """True when other definitions share this name, so the count is spread over them.

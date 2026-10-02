@@ -25,6 +25,7 @@ _CLASS = "class_definition"
 
 class PythonAdapter:
     name = "python"
+    grammar = "python"
     extensions = (".py", ".pyi")
 
     def extract(self, source: bytes) -> FileFacts:
@@ -33,6 +34,7 @@ class PythonAdapter:
         # name is not the definition's name, so a call under the alias resolves to
         # nothing and the chain silently breaks at the import.
         aliases = _import_aliases(tree.root_node)
+        imported_from = _import_modules(tree.root_node)
         # `controller = CheckoutController()` then `controller.apply_promo_code()`.
         # The assignment states the type, and without reading it a plain call chain
         # splits into one disconnected root per hop.
@@ -86,6 +88,7 @@ class PythonAdapter:
                             line=line_of(node),
                             caller=caller,
                             form=form,
+                            module=imported_from.get(callee, ""),
                             scope=scope,
                         )
                     )
@@ -98,6 +101,7 @@ class PythonAdapter:
                             line=line_of(node),
                             caller=caller,
                             form=LITERAL,
+                            module=imported_from.get(name, ""),
                         )
                     )
 
@@ -123,6 +127,39 @@ def _import_aliases(root: Any) -> dict[str, str]:
         if alias and leaf and alias != leaf:
             aliases[alias] = leaf
     return aliases
+
+
+def _import_modules(root: Any) -> dict[str, str]:
+    """Local name -> the module it was imported from.
+
+    `from app.users import render` says exactly which `render` is meant. Without reading
+    it, a call to an unqualified name fans out across every definition sharing that name,
+    which is the single most common source of false edges in Python.
+
+    Relative imports (`from . import x`) are skipped: resolving them needs the importing
+    file's own package position, and a wrong module here would narrow resolution to the
+    wrong file — worse than leaving it ambiguous.
+    """
+    modules: dict[str, str] = {}
+    for node in walk(root):
+        if node.type != "import_from_statement":
+            continue
+        source = node.child_by_field_name("module_name")
+        if source is None:
+            continue
+        dotted = text(source)
+        if not dotted or dotted.startswith("."):
+            continue
+        for child in node.named_children:
+            if child is source:
+                continue
+            if child.type == "dotted_name":
+                modules[last_segment(text(child))] = dotted
+            elif child.type == "aliased_import":
+                parts = child.named_children
+                if len(parts) == 2:
+                    modules[text(parts[1])] = dotted
+    return modules
 
 
 def _start_line(node: Any) -> int:

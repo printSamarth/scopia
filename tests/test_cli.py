@@ -130,8 +130,38 @@ def test_review_subcommand_is_accepted(run, py_fixture):
     assert "symbols touched" in out
 
 
+def test_react_report_names_components_not_dom(run, react_fixture):
+    """The report is about this repo. `<form>` and `<input>` belong to the browser."""
+    code, out = run(react_fixture, RANGE, "--no-color")
+    assert code == 0
+    assert "CheckoutForm" in out
+    assert "PromoField" in out, "a rendered component is part of the change"
+    assert "NOT ANALYSED" not in out, "every file in the fixture has a parser"
+    body = out.split("CALL CHAINS", 1)[1]
+    for tag in ("<form", "<input", "<span"):
+        assert tag not in body
+
+
 def test_working_tree_is_the_zero_argument_default(run, py_fixture):
     """Bare `scopia` must do something useful with no arguments at all."""
     code, out = run(py_fixture, "--no-color")
     assert code == 0
     assert out.strip()
+
+
+def test_impatient_double_ctrl_c_exits_quietly(monkeypatch, py_fixture, capsys):
+    """A second Ctrl-C lands while the first is still tearing down.
+
+    Quitting is what was asked for either way; a stack trace makes a normal exit look
+    like a crash, and watch mode is quit by Ctrl-C every single time.
+    """
+    import scopia.cli as cli
+
+    monkeypatch.chdir(py_fixture.root)
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_watch", interrupted)
+    assert main(["--watch"]) == 0
+    assert "Traceback" not in capsys.readouterr().err

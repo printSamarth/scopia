@@ -7,7 +7,16 @@ from dataclasses import dataclass
 
 from ..index.repo import RepoIndex, build_index, extract, uid
 from ..lang import adapter_for, enclosing_symbol
-from ..lang.base import LITERAL, METHOD, PLAIN, RECEIVER, SELF, FileFacts, SymbolDef
+from ..lang.base import (
+    CLASS,
+    LITERAL,
+    METHOD,
+    PLAIN,
+    RECEIVER,
+    SELF,
+    FileFacts,
+    SymbolDef,
+)
 from ..vcs.diff import ADDED, DELETED, FileChange, parse_diff
 from ..vcs.git import Repo, Revisions
 from .model import AMBIGUOUS, CALL, HEURISTIC, IMPLEMENTS, INFERRED, STATIC, Edge, Graph, Node
@@ -22,6 +31,10 @@ DEFAULT_MAX_NODES = 60
 # The same number on a *changed* symbol means the opposite, and is never hidden: a small
 # edit to something called from everywhere is the most important thing a review can show.
 DEFAULT_UTILITY_FAN_IN = 12
+
+# How far to climb looking for an entry point before giving up. Deep enough for a real
+# controller -> service -> repository -> helper stack, bounded so a cycle cannot hang.
+MAX_CLIMB = 8
 
 # Beyond this many callers, the fan-in number on the node says it better than boxes do.
 MAX_DRAWN_CALLERS = 12
@@ -57,12 +70,20 @@ def build_graph(
     jobs: int | None = None,
     utility_fan_in: int = DEFAULT_UTILITY_FAN_IN,
     exclude: tuple[str, ...] = (),
+    to_entry: bool = False,
+    only_paths: frozenset[str] | None = None,
 ) -> Graph:
     changes = parse_diff(repo.diff(revisions))
     if revisions.head is None:
         # Reviewing the working tree: `git diff` cannot see files git does not know
         # about, so a brand-new file would be missing entirely with nothing to say so.
         changes.extend(_untracked_changes(repo, {c.path for c in changes}))
+    if only_paths is not None:
+        # Watch mode narrows to what has moved since the session began. Against HEAD a
+        # dirty tree starts the graph full of work that was already there, and the file
+        # the agent just wrote is one node among hundreds — the overwhelm this is meant
+        # to cure.
+        changes = [c for c in changes if c.path in only_paths or c.old_path in only_paths]
     unparsed: list[tuple[str, int]] = []
     touched = collect_touched(repo, revisions, changes, unparsed)
 
@@ -89,12 +110,18 @@ def build_graph(
         )
 
     edges: dict[tuple[str, str, str], Edge] = {}
+    touched_uids = frozenset(nodes)
     frontier = set(nodes)
     skipped: set[str] = set()
     for _ in range(max(hops, 0)):
-        frontier = _expand(index, nodes, edges, frontier, utility_fan_in, skipped)
+        frontier = _expand(
+            index, nodes, edges, frontier, utility_fan_in, skipped, touched_uids
+        )
         if not frontier:
             break
+
+    if to_entry:
+        _climb_to_entries(index, nodes, edges, utility_fan_in, skipped)
 
     # Edges between nodes already in the set but not discovered during expansion
     # (for example two touched symbols that call each other).
@@ -103,13 +130,17 @@ def build_graph(
     for node in nodes.values():
         node.fan_in = index.fan_in(node.uid)
         node.fan_in_shared = index.fan_in_is_shared(node.uid)
+        # Nothing in the repo calls it, but it calls something — so it is invoked from
+        # outside: a route, a schedule, a command. That is where reading should start.
+        node.is_entry = node.fan_in == 0 and bool(index.callees_of.get(node.uid))
     for edge in edges.values():
         if edge.src in nodes:
             nodes[edge.src].degree += 1
         if edge.dst in nodes:
             nodes[edge.dst].degree += 1
 
-    graph.nodes = list(nodes.values())
+    graph.index = index
+    graph.nodes = _drop_redundant_containers(list(nodes.values()), edges)
     graph.edges = list(edges.values())
     graph.utilities_hidden = len(skipped)
     _cap(graph, max_nodes)
@@ -284,35 +315,38 @@ def _expand(
     frontier: set[str],
     utility_fan_in: int,
     skipped: set[str],
+    touched_uids: frozenset[str],
 ) -> set[str]:
     """One hop outward — callers in, callees out. Never a transitive closure."""
     discovered: set[str] = set()
 
     for src in frontier:
-        for callee_name, form, scope in index.callees_of.get(src, ()):
+        for callee_name, form, scope, module in index.callees_of.get(src, ()):
             reachable = []
             for target in index.candidates(callee_name):
-                if _is_utility(index, nodes, target, utility_fan_in):
+                if _is_utility(index, nodes, target, utility_fan_in, touched_uids):
                     skipped.add(target)
                     continue
                 reachable.append(target)
-            _add_edges(index, nodes, edges, discovered, src, reachable, CALL, form, scope)
+            _add_edges(
+                index, nodes, edges, discovered, src, reachable, CALL, form, scope, module
+            )
 
         definition = index.defs.get(src)
         if definition is not None:
             callers = {
-                (c, f, sc)
-                for c, f, sc in index.callers_of_name.get(definition.name, ())
+                (c, f, sc, m)
+                for c, f, sc, m in index.callers_of_name.get(definition.name, ())
                 if c != src
             }
             # Past a dozen or so, drawing each caller adds nothing the node's own fan-in
             # count does not already say, and on a heavily-used helper it would build
             # tens of thousands of boxes only for the cap to throw them away.
             if len(callers) <= MAX_DRAWN_CALLERS:
-                for caller, caller_form, caller_scope in callers:
+                for caller, caller_form, caller_scope, caller_module in callers:
                     _add_edges(
                         index, nodes, edges, discovered, caller, [src], CALL,
-                        caller_form, caller_scope,
+                        caller_form, caller_scope, caller_module,
                     )
 
         for base_name in index.bases_of.get(src, ()):
@@ -358,6 +392,7 @@ def _add_edges(
     kind: str,
     form: str = PLAIN,
     scope: str = "",
+    module: str = "",
 ) -> None:
     targets = [t for t in targets if t != src]
     if kind == CALL:
@@ -371,7 +406,7 @@ def _add_edges(
         # would bury the change under noise.
         return
 
-    targets, provenance = _narrow(index, src, targets, form, scope)
+    targets, provenance = _narrow(index, src, targets, form, scope, module)
     if not targets:
         return
 
@@ -411,17 +446,62 @@ def _ensure_node(
 _MAX_SCOPE_DEPTH = 6
 
 
+def _climb_to_entries(
+    index: RepoIndex,
+    nodes: dict[str, Node],
+    edges: dict[tuple[str, str, str], Edge],
+    utility_fan_in: int,
+    skipped: set[str],
+) -> None:
+    """Follow callers upward until each path reaches something nothing calls.
+
+    A fixed hop count cannot answer "where does this change get triggered from" — the
+    answer is however deep the stack happens to be. This climbs only upward, so the
+    graph grows toward origins rather than ballooning with callees at every level.
+    """
+    frontier = set(nodes)
+    for _ in range(MAX_CLIMB):
+        discovered: set[str] = set()
+        for uid_ in frontier:
+            definition = index.defs.get(uid_)
+            if definition is None or index.fan_in(uid_) == 0:
+                continue  # already an entry point: stop climbing this path
+            callers = {
+                (c, f, sc, m)
+                for c, f, sc, m in index.callers_of_name.get(definition.name, ())
+                if c != uid_
+            }
+            if len(callers) > MAX_DRAWN_CALLERS:
+                continue
+            for caller, form, scope, module in callers:
+                _add_edges(
+                    index, nodes, edges, discovered, caller, [uid_], CALL,
+                    form, scope, module,
+                )
+        if not discovered:
+            break
+        frontier = discovered
+
+
 def _is_utility(
-    index: RepoIndex, nodes: dict[str, Node], target: str, threshold: int
+    index: RepoIndex,
+    nodes: dict[str, Node],
+    target: str,
+    threshold: int,
+    changed: frozenset[str],
 ) -> bool:
     """Shared plumbing pulled in as context, rather than part of this change.
 
     Only ever applies to symbols that did not change and are not already in the graph —
     a changed symbol keeps its place no matter how widely it is called.
+
+    Callers belonging to the change do not count toward the threshold. Twenty new
+    handlers calling one service made that service look like plumbing and hid it, taking
+    every edge from the new work with it and leaving it looking unconnected.
     """
     if threshold <= 0 or target in nodes:
         return False
-    return index.fan_in(target) > threshold
+    return index.fan_in_outside(target, changed) > threshold
 
 
 def _scope_chain(index: RepoIndex, scope: str) -> set[str]:
@@ -445,6 +525,23 @@ def _scope_chain(index: RepoIndex, scope: str) -> set[str]:
     return seen
 
 
+def _in_module(index: RepoIndex, symbol_uid: str, module: str) -> bool:
+    """Does this definition live in the module the import named?
+
+    `app.users` matches `app/users.py` and `app/users/__init__.py`. Matched on a path
+    suffix rather than an exact root, because the import is relative to whatever is on
+    `sys.path`, which a static pass cannot know — `src/app/users.py` is a legitimate home
+    for `app.users`.
+    """
+    path = index.path_of.get(symbol_uid, "")
+    if not path:
+        return False
+    stem = path.rsplit(".", 1)[0]
+    if stem.endswith("/__init__"):
+        stem = stem[: -len("/__init__")]
+    return f"/{stem}".endswith("/" + module.replace(".", "/"))
+
+
 def _owner(index: RepoIndex, symbol_uid: str) -> str:
     """The class a method belongs to, or "" for a free function."""
     definition = index.defs.get(symbol_uid)
@@ -457,7 +554,12 @@ def _has_body(index: RepoIndex, symbol_uid: str) -> bool:
 
 
 def _narrow(
-    index: RepoIndex, src: str, targets: list[str], form: str = PLAIN, scope: str = ""
+    index: RepoIndex,
+    src: str,
+    targets: list[str],
+    form: str = PLAIN,
+    scope: str = "",
+    module: str = "",
 ) -> tuple[list[str], str]:
     """Pick the plausible targets of a call, and say how confident that is.
 
@@ -493,6 +595,16 @@ def _narrow(
     # honour it: without it, one precise call fans out across every same-named method in
     # the repo, which is how `OrderController::show` ended up pointing at three other
     # controllers.
+    # `from app.users import render` names the file the definition lives in. This is free
+    # — no index, no toolchain — and it is the commonest source of false fan-out in
+    # Python, where unqualified calls are the norm.
+    if module and len(targets) > 1:
+        from_module = [t for t in targets if _in_module(index, t, module)]
+        if len(from_module) == 1:
+            return from_module, STATIC
+        if from_module:
+            targets = from_module
+
     if scope:
         # A method called on `OrderRepository` may well be declared on a class it
         # extends, so the whole ancestor chain counts as in-scope — otherwise every
@@ -525,17 +637,48 @@ def _link_existing(
     edges: dict[tuple[str, str, str], Edge],
 ) -> None:
     for src in list(nodes):
-        for callee_name, form, scope in index.callees_of.get(src, ()):
+        for callee_name, form, scope, module in index.callees_of.get(src, ()):
             # Same body filter as the expansion path: an interface declaration is not a
             # call target, and applying the rule in only one place made the two paths
             # disagree about the very same call.
             reachable = [t for t in index.candidates(callee_name) if _has_body(index, t)]
-            candidates, provenance = _narrow(index, src, reachable, form, scope)
+            candidates, provenance = _narrow(index, src, reachable, form, scope, module)
             for target in candidates:
                 if target not in nodes or target == src:
                     continue
                 edge = Edge(src=src, dst=target, kind=CALL, provenance=provenance)
                 edges.setdefault(edge.key, edge)
+
+
+def _drop_redundant_containers(nodes: list[Node], edges: dict) -> list[Node]:
+    """Hide a file or class node when something inside it is already shown.
+
+    A new file yields three nodes for one thing — the module, the class, and the method
+    — and the module and class say nothing the method does not. They earn their place
+    only when nothing inside them is drawn, which is how a config constant or a bare
+    class declaration still appears.
+    """
+    linked = {e.src for e in edges.values()} | {e.dst for e in edges.values()}
+    inner_paths = {
+        n.path for n in nodes if n.kind not in (MODULE_KIND, CLASS) and n.touched
+    }
+    inner_parents = {
+        (n.path, n.label.rsplit(".", 1)[0])
+        for n in nodes
+        if n.kind not in (MODULE_KIND, CLASS) and "." in n.label
+    }
+
+    kept = []
+    for node in nodes:
+        if node.uid in linked:
+            kept.append(node)  # it has edges, so it is carrying information
+        elif node.kind == MODULE_KIND and node.path in inner_paths:
+            continue
+        elif node.kind == CLASS and (node.path, node.label) in inner_parents:
+            continue
+        else:
+            kept.append(node)
+    return kept
 
 
 def _cap(graph: Graph, max_nodes: int) -> None:
@@ -585,15 +728,21 @@ def _number_calls(graph: Graph) -> None:
     counter = 0
     seen: set[tuple[str, str]] = set()
 
-    def visit(uid_: str) -> None:
-        nonlocal counter
-        for edge in sorted(outgoing.get(uid_, ()), key=lambda e: (e.line or 0, e.dst)):
+    def ordered(uid_: str):
+        return iter(sorted(outgoing.get(uid_, ()), key=lambda e: (e.line or 0, e.dst)))
+
+    # Depth-first with an explicit stack: a long call chain in a large, uncapped graph
+    # would otherwise exhaust Python's recursion limit.
+    for root in sorted(roots):
+        stack = [ordered(root)]
+        while stack:
+            edge = next(stack[-1], None)
+            if edge is None:
+                stack.pop()
+                continue
             if (edge.src, edge.dst) in seen:
                 continue
             seen.add((edge.src, edge.dst))
             counter += 1
             edge.order = counter
-            visit(edge.dst)
-
-    for root in sorted(roots):
-        visit(root)
+            stack.append(ordered(edge.dst))

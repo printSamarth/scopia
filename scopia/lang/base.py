@@ -56,6 +56,13 @@ class CallSite:
     line: int
     caller: str | None
     form: str = PLAIN
+    module: str = ""
+    """Module the name was imported from, when an import says so.
+
+    `from app.users import render` states which `render` is meant. Python's import system
+    is the type system for this purpose, and ignoring it fans a precise call out across
+    every same-named definition in the repo.
+    """
     scope: str = ""
     """Class the call site names for its receiver, when it names one.
 
